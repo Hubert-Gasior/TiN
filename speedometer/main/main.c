@@ -70,7 +70,7 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     printf("\n================================================\n");
-    printf("Uruchamianie testów jednostkowych dla ESP32...\n");
+    printf("starting Unit Test...\n");
     printf("================================================\n\n");
 
     UNITY_BEGIN();

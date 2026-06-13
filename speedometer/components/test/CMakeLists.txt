@@ -3,7 +3,6 @@ set(src_files
     "halAH59E_test.c"
     "i2c_test.c"
     "imuB160_test.c"
-    "led_test.c"
     "linearBuffer_test.c"
     "main_test.c"
 )

@@ -1,143 +1,178 @@
 #include "unity.h"
 #include "esp_err.h"
 #include <string.h>
-#include "main.h" // Twój plik nagłówkowy main
+
+#include "main.h" 
 #include "types.h"
 #include "linearBuffer.h"
 #include "imuB160.h"
 
-// --- Zmienne środowiska wirtualnego ---
+extern float32 CalculateVelocity(AppData const *appData);
+extern float32 CalculatePitch(ImuData const *imuData);
+
 static int64 mock_system_time_us = 0;
 static bool mock_is_connected = false;
 static bool bt_send_was_called = false;
 static uint8 last_sent_buffer[SEND_BUFFER_SIZE];
 
-// Dostęp do zmiennych globalnych z main.c
+static esp_err_t mock_imu_read_ret = ESP_OK;
+static esp_err_t mock_bt_send_ret = ESP_OK;
+
 extern LinearBuffer LinearSendBuffer;
 extern bool volatile HalReady;
 extern bool dataReady;
 extern AppData sAppData;
 extern void AppTick(void);
 
-// --- Atrapy (Mocks) ---
-
-int64 __wrap_esp_timer_get_time(void) {
+int64 __wrap_esp_timer_get_time(void) 
+{
     return mock_system_time_us;
 }
 
-void __wrap_vTaskDelay(uint32_t ticks) {
-    // Sztuczny upływ czasu - zakładamy, że 1 tick to 1ms
-    // Pozwala to na szybkie przetestowanie timeoutu bez fizycznego czekania
-    mock_system_time_us += (ticks * 1000); 
+void __wrap_vTaskDelay(uint32_t ticks) 
+{
+    mock_system_time_us += (ticks * 1000);
 }
 
-bool __wrap_IsConnected(void) {
+bool __wrap_IsConnected(void) 
+{
     return mock_is_connected;
 }
 
-esp_err_t __wrap_ImuRead(void const *devHandle, ImuData *data) {
-    data->accX = 0.0f; data->accY = 0.0f; data->accZ = 1.0f; 
+esp_err_t __wrap_ImuRead(void const *devHandle, ImuData *data) 
+{
+    if (mock_imu_read_ret != ESP_OK) 
+    {
+        return mock_imu_read_ret;
+    }
+
+    data->accX = 0.0f; 
+    data->accY = 0.0f; 
+    data->accZ = 1.0f; 
     return ESP_OK;
 }
 
-esp_err_t __wrap_BtSend(uint8 const *buffer, uint32 const size) {
+esp_err_t __wrap_BtSend(uint8 const *buffer, uint32 const size) 
+{
     bt_send_was_called = true;
+    if (mock_bt_send_ret != ESP_OK) 
+    {
+        return mock_bt_send_ret;
+    }
     memcpy(last_sent_buffer, buffer, size);
     return ESP_OK;
 }
-
-// --- Setup & Teardown ---
 
 void setUp(void)
 {
     mock_system_time_us = 0;
     mock_is_connected = true;
     bt_send_was_called = false;
+    mock_imu_read_ret = ESP_OK;   
+    mock_bt_send_ret = ESP_OK;    
     memset(last_sent_buffer, 0, sizeof(last_sent_buffer));
     
     HalReady = false;
     dataReady = false;
     sAppData.distance = 100.0f; 
     sAppData.circumference = 2.0f;
-    sAppData.interval = 500000; // 0.5s interwał z poprzedniego obrotu
+    sAppData.interval = 500000;
     
     static uint8 dummySendBuff[SEND_BUFFER_SIZE];
     LinearBufferInit(&LinearSendBuffer, dummySendBuff, SEND_BUFFER_SIZE);
 }
 
-void tearDown(void) {}
-
-// --- Przypadki Testowe ---
-
-TEST_CASE("AppTick: Poprawnie odczytuje czujniki i wysyla przez Bluetooth", "[app_main]")
+void tearDown(void) 
 {
-    // 1. Akcja: Uruchamiamy pierwszy cykl. Rower jedzie (HalReady = true).
+    ;
+}
+
+TEST_CASE("AppTick: Correctly reads sensors and sends via Bluetooth", "[app_main]")
+{
     HalReady = true;
     AppTick();
 
-    // Po pierwszym przejściu flagi powinny być zaktualizowane
     TEST_ASSERT_TRUE(dataReady);
     TEST_ASSERT_FALSE(HalReady);
-    
-    // BtSend zostało zawołane w tym samym ticku, ponieważ dataReady 
-    // stało się true, a IsConnected() == true
     TEST_ASSERT_TRUE(bt_send_was_called);
-    
-    // Upewniamy się, że wysłane dane zostały po tym wyczyszczone (flaga opuszczona)
     TEST_ASSERT_FALSE(dataReady);
 }
 
-TEST_CASE("AppTick: Po osiagnieciu Timeoutu Halla aplikacja kontynuuje dzialanie", "[app_main]")
+TEST_CASE("AppTick: Application continues execution after Hall sensor timeout", "[app_main]")
 {
-    // Symulacja zatrzymanego koła (HalReady się nie zmienia)
-    HalReady = false; 
+    HalReady = false;
 
-    // Akcja: Wywołanie AppTick. Funkcja utknie w pętli while(!HalReady), ale
-    // atrapa vTaskDelay przesunie wirtualny czas, aż pętla przerwie działanie przez `break`.
     AppTick();
-
-    // Weryfikacja: Mimo timeoutu, kod (zgodnie z oryginalną logiką) wysyła dane
-    TEST_ASSERT_TRUE(dataReady == false); // Zostało wysłane i wyzerowane
+    TEST_ASSERT_TRUE(dataReady == false); 
     TEST_ASSERT_TRUE(bt_send_was_called);
-
-    // Zgodnie z obecną logiką, kod użył starego interwału (0.5s) do obliczeń
-    // Weryfikujemy, czy dane w buforze nie są wyzerowane
     TEST_ASSERT_NOT_EQUAL(0, strncmp("0.00;", (char*)last_sent_buffer, 5));
 }
 
-TEST_CASE("AppTick: Brak Bluetooth pozostawia dane w buforze na pozniej", "[app_main]")
+TEST_CASE("AppTick: Lack of Bluetooth leaves data in the buffer for later", "[app_main]")
 {
-    // 1. Symulujemy jazdę bez połączenia Bluetooth
     mock_is_connected = false;
     HalReady = true;
 
-    // 2. Akcja: Tick przetwarza czujniki
     AppTick();
 
-    // 3. Weryfikacja: Dane zostały odczytane, ale nie wysłane
     TEST_ASSERT_TRUE(dataReady);
     TEST_ASSERT_FALSE(bt_send_was_called);
-
-    // 4. Kolejny tick symuluje powrót połączenia BT
     mock_is_connected = true;
     AppTick();
 
-    // 5. Weryfikacja: W drugim ticku zaległe dane zostały wysłane
     TEST_ASSERT_TRUE(bt_send_was_called);
-    TEST_ASSERT_FALSE(dataReady); // Proces prawidłowo obsłużony
+    TEST_ASSERT_FALSE(dataReady);
 }
 
-TEST_CASE("AppTick: Zawodzi ImuRead", "[app_main]")
+TEST_CASE("CalculateVelocity: Protection against division by zero and negative time", "[math]")
 {
-    extern esp_err_t __wrap_ImuRead(void const *devHandle, ImuData *data);
+    AppData testData = { .circumference = 2.0f, .interval = 0 };
     
-    // Przesłaniamy atrapę lokalnie w tym teście, aby zwróciła błąd
-    // Z uwagi na brak możliwości łatwego redefiniowania __wrap_ w runtime dla C,
-    // w pełnym środowisku użylibyśmy zmiennej sterującej, np. mock_imu_read_ret = ESP_FAIL;
-    // Poniższy test zakładałby ominięcie całego bloku.
+    float32 velZero = CalculateVelocity(&testData);
+    TEST_ASSERT_EQUAL_FLOAT(-1.0f, velZero);
+
+    testData.interval = -500;
+    float32 velNeg = CalculateVelocity(&testData);
+    TEST_ASSERT_EQUAL_FLOAT(-1.0f, velNeg);
+}
+
+TEST_CASE("CalculatePitch: Behavior in extreme positions (Gimbal Lock / Freefall)", "[math]")
+{
+    ImuData testImu = {0};
+
+    testImu.accX = 1.0f; testImu.accY = 0.0f; testImu.accZ = 0.0f;
+    float32 pitchDown = CalculatePitch(&testImu);
+    TEST_ASSERT_FLOAT_WITHIN(0.1f, -90.0f, pitchDown);
+
+    testImu.accX = -1.0f; testImu.accY = 0.0f; testImu.accZ = 0.0f;
+    float32 pitchUp = CalculatePitch(&testImu);
+    TEST_ASSERT_FLOAT_WITHIN(0.1f, 90.0f, pitchUp);
+
+    testImu.accX = 0.0f; testImu.accY = 0.0f; testImu.accZ = 0.0f;
+    float32 pitchFreefall = CalculatePitch(&testImu);
+    TEST_ASSERT_FLOAT_WITHIN(0.1f, 0.0f, pitchFreefall);
+}
+
+TEST_CASE("AppTick: ImuRead fails (I2C bus failure)", "[app_main]")
+{
+    mock_imu_read_ret = ESP_FAIL;
+    HalReady = true;
+
+    AppTick();
+
+    TEST_ASSERT_FALSE(dataReady);
+    TEST_ASSERT_FALSE(bt_send_was_called);
+}
+
+TEST_CASE("AppTick: Packet rejection by Bluetooth (Queuing for retransmission)", "[app_main]")
+{
+    HalReady = true;
+    mock_is_connected = true; 
     
-    // (Pseudokod weryfikacji)
-    // mock_imu_read_ret = ESP_FAIL;
-    // AppTick();
-    // TEST_ASSERT_FALSE(dataReady);
+    mock_bt_send_ret = ESP_FAIL; 
+
+    AppTick();
+
+    TEST_ASSERT_TRUE(bt_send_was_called);
+    TEST_ASSERT_TRUE(dataReady);
 }
